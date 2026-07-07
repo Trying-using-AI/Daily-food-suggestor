@@ -12,7 +12,7 @@
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
-const ANTHROPIC_MODEL = Deno.env.get('ANTHROPIC_MODEL') ?? 'claude-opus-4-8';
+const ANTHROPIC_MODEL = Deno.env.get('ANTHROPIC_MODEL') ?? 'claude-haiku-4-5';
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY') ?? '';
 
@@ -212,6 +212,16 @@ Deno.serve(async (req: Request) => {
       .filter(Boolean)
       .join('\n');
 
+    // Structured output works on all current models. The `effort` control is
+    // only valid on Opus/Sonnet-tier models — it errors on Haiku 4.5 — so add
+    // it only when the configured model supports it.
+    const outputConfig: Record<string, unknown> = {
+      format: { type: 'json_schema', schema: RECIPE_SCHEMA },
+    };
+    if (!ANTHROPIC_MODEL.includes('haiku')) {
+      outputConfig.effort = 'low';
+    }
+
     const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -223,10 +233,7 @@ Deno.serve(async (req: Request) => {
         model: ANTHROPIC_MODEL,
         max_tokens: 4096,
         system: systemPrompt,
-        output_config: {
-          effort: 'low',
-          format: { type: 'json_schema', schema: RECIPE_SCHEMA },
-        },
+        output_config: outputConfig,
         messages: [{ role: 'user', content: userPrompt }],
       }),
     });

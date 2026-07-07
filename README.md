@@ -82,8 +82,8 @@ supabase db push
 ```bash
 supabase functions deploy suggest-recipes
 supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
-# optional — defaults to claude-opus-4-8. Use claude-haiku-4-5 for lower cost/latency.
-supabase secrets set ANTHROPIC_MODEL=claude-opus-4-8
+# optional — defaults to claude-haiku-4-5. Use claude-opus-4-8 for higher quality.
+supabase secrets set ANTHROPIC_MODEL=claude-haiku-4-5
 ```
 
 ### 6. Run
@@ -99,9 +99,10 @@ suggestions.
 
 ## Choosing a model
 
-The Edge Function reads `ANTHROPIC_MODEL` (default `claude-opus-4-8`). For a recipe
-generator you may prefer a faster / cheaper model — set
-`ANTHROPIC_MODEL=claude-haiku-4-5`. No code change needed.
+The Edge Function reads `ANTHROPIC_MODEL` (default `claude-haiku-4-5` — fast and
+cost-effective, well-suited to recipe generation). For higher-quality suggestions set
+`ANTHROPIC_MODEL=claude-opus-4-8`. No code change needed. Note that `effort` tuning is
+applied automatically only for Opus/Sonnet-tier models (Haiku doesn't support it).
 
 ## Data model
 
