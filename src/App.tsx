@@ -129,7 +129,7 @@ VITE_SUPABASE_ANON_KEY=your-anon-key`}
         <p className="muted">
           Then run the migration in <code>supabase/migrations</code>, deploy the{' '}
           <code>suggest-recipes</code> function, and set the{' '}
-          <code>ANTHROPIC_API_KEY</code> secret. Full steps are in the{' '}
+          <code>LLM_API_KEY</code> secret (a free Groq key works). Full steps are in the{' '}
           <strong>README</strong>.
         </p>
         <button className="btn primary" onClick={() => location.reload()}>

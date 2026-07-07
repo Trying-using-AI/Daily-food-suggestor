@@ -1,18 +1,33 @@
 // Supabase Edge Function: suggest-recipes
 //
-// Generates meal suggestions with Claude. The Anthropic API key lives here as a
+// Generates meal suggestions from an LLM. The API key lives here as a
 // server-side secret and never reaches the browser. The function reads the
 // caller's preferences, pantry, and recent accept/reject history (through their
-// own JWT, so Row Level Security applies) and asks Claude for structured recipes.
+// own JWT, so Row Level Security applies) and asks the model for structured
+// recipes.
+//
+// Works with ANY OpenAI-compatible chat-completions endpoint, so you can run an
+// open-source model. Defaults to Groq + Gemma (free & fast). Configure with:
+//   LLM_API_KEY   (required)  e.g. your Groq / OpenRouter / Together key
+//   LLM_BASE_URL  (optional)  default https://api.groq.com/openai/v1
+//   LLM_MODEL     (optional)  default gemma2-9b-it
+//
+// Examples:
+//   Groq + Gemma   : LLM_BASE_URL=https://api.groq.com/openai/v1        LLM_MODEL=gemma2-9b-it
+//   Groq + Llama   : LLM_BASE_URL=https://api.groq.com/openai/v1        LLM_MODEL=llama-3.3-70b-versatile
+//   OpenRouter     : LLM_BASE_URL=https://openrouter.ai/api/v1          LLM_MODEL=google/gemma-2-9b-it:free
+//   Google AI (Gemma): LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai  LLM_MODEL=gemma-3-27b-it
+//   Together        : LLM_BASE_URL=https://api.together.xyz/v1          LLM_MODEL=google/gemma-2-27b-it
 //
 // Deploy:  supabase functions deploy suggest-recipes
-// Secrets: supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
-//          (optional) supabase secrets set ANTHROPIC_MODEL=claude-opus-4-8
+// Secrets: supabase secrets set LLM_API_KEY=...
 
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 
-const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
-const ANTHROPIC_MODEL = Deno.env.get('ANTHROPIC_MODEL') ?? 'claude-haiku-4-5';
+const LLM_API_KEY = Deno.env.get('LLM_API_KEY') ?? '';
+const LLM_BASE_URL =
+  (Deno.env.get('LLM_BASE_URL') ?? 'https://api.groq.com/openai/v1').replace(/\/$/, '');
+const LLM_MODEL = Deno.env.get('LLM_MODEL') ?? 'gemma2-9b-it';
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? '';
 const SUPABASE_ANON_KEY = Deno.env.get('SUPABASE_ANON_KEY') ?? '';
 
@@ -33,59 +48,26 @@ interface RequestBody {
   context?: string; // free-form note, e.g. "quick weeknight dinner"
 }
 
-const RECIPE_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    recipes: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          title: { type: 'string' },
-          meal_type: { type: 'string', enum: ['breakfast', 'lunch', 'dinner'] },
-          cuisine: { type: 'string' },
-          description: { type: 'string' },
-          ingredients: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                item: { type: 'string' },
-                quantity: { type: 'string' },
-              },
-              required: ['item', 'quantity'],
-            },
-          },
-          steps: { type: 'array', items: { type: 'string' } },
-          tags: { type: 'array', items: { type: 'string' } },
-          prep_minutes: { type: 'integer' },
-          cook_minutes: { type: 'integer' },
-          servings: { type: 'integer' },
-          calories: { type: 'integer' },
-          uses_pantry_items: { type: 'array', items: { type: 'string' } },
-        },
-        required: [
-          'title',
-          'meal_type',
-          'cuisine',
-          'description',
-          'ingredients',
-          'steps',
-          'tags',
-          'prep_minutes',
-          'cook_minutes',
-          'servings',
-          'calories',
-          'uses_pantry_items',
-        ],
-      },
-    },
-  },
-  required: ['recipes'],
-};
+// Human-readable JSON contract embedded in the prompt. Open models honor a
+// clear shape description reliably when combined with JSON response mode.
+const JSON_SHAPE = `{
+  "recipes": [
+    {
+      "title": "string",
+      "meal_type": "breakfast | lunch | dinner",
+      "cuisine": "string",
+      "description": "one appetizing sentence",
+      "ingredients": [{ "item": "string", "quantity": "string" }],
+      "steps": ["step 1", "step 2"],
+      "tags": ["string"],
+      "prep_minutes": 0,
+      "cook_minutes": 0,
+      "servings": 0,
+      "calories": 0,
+      "uses_pantry_items": ["string"]
+    }
+  ]
+}`;
 
 function list(arr: string[] | null | undefined): string {
   return arr && arr.length ? arr.join(', ') : 'none';
@@ -97,8 +79,8 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    if (!ANTHROPIC_API_KEY) {
-      return json({ error: 'ANTHROPIC_API_KEY is not configured on the server.' }, 500);
+    if (!LLM_API_KEY) {
+      return json({ error: 'LLM_API_KEY is not configured on the server.' }, 500);
     }
 
     const authHeader = req.headers.get('Authorization') ?? '';
@@ -167,12 +149,16 @@ Deno.serve(async (req: Request) => {
       'You are a thoughtful personal chef and meal planner.',
       'Generate realistic, appealing home-cooked recipes tailored to one person\'s profile.',
       'Hard rules you must NEVER break:',
-      `- Respect ALL allergies. Do not include any allergen or an ingredient derived from it.`,
-      `- Respect ALL dietary restrictions (e.g. vegetarian, vegan, halal, keto).`,
-      `- Honor health conditions with appropriate choices (e.g. lower sodium for hypertension, lower added sugar / lower glycemic for diabetes).`,
+      '- Respect ALL allergies. Do not include any allergen or an ingredient derived from it.',
+      '- Respect ALL dietary restrictions (e.g. vegetarian, vegan, halal, keto).',
+      '- Honor health conditions with appropriate choices (e.g. lower sodium for hypertension, lower added sugar / lower glycemic for diabetes).',
       '- Never include an ingredient the user listed as disliked.',
       'Soft preferences: favor liked cuisines, keep within the max prep time, match the spice level and serving size, and support the user\'s goals.',
       'Return practical ingredient lists with quantities and clear numbered steps. Keep calories a reasonable per-serving estimate.',
+      '',
+      'Respond with a single valid JSON object only — no markdown, no code fences, no commentary.',
+      'Use exactly this JSON shape:',
+      JSON_SHAPE,
     ].join('\n');
 
     const pantryInstruction = usePantry
@@ -180,7 +166,7 @@ Deno.serve(async (req: Request) => {
       : `Ignore pantry contents for this request. Leave "uses_pantry_items" as an empty array.`;
 
     const userPrompt = [
-      `Create ${count} distinct ${mealType} recipe${count > 1 ? 's' : ''}.`,
+      `Create ${count} distinct ${mealType} recipe${count > 1 ? 's' : ''} as JSON.`,
       '',
       'User profile:',
       `- Diets/restrictions: ${list(p.diets)}`,
@@ -207,70 +193,84 @@ Deno.serve(async (req: Request) => {
         : '',
       body.context ? `Extra context: ${body.context}` : '',
       '',
-      `Every recipe\'s meal_type must be "${mealType}". Make the ${count} recipes varied from each other.`,
+      `Every recipe's meal_type must be "${mealType}". Make the ${count} recipes varied from each other.`,
     ]
       .filter(Boolean)
       .join('\n');
 
-    // Structured output works on all current models. The `effort` control is
-    // only valid on Opus/Sonnet-tier models — it errors on Haiku 4.5 — so add
-    // it only when the configured model supports it.
-    const outputConfig: Record<string, unknown> = {
-      format: { type: 'json_schema', schema: RECIPE_SCHEMA },
-    };
-    if (!ANTHROPIC_MODEL.includes('haiku')) {
-      outputConfig.effort = 'low';
-    }
-
-    const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
+    const llmRes = await fetch(`${LLM_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        authorization: `Bearer ${LLM_API_KEY}`,
       },
       body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
+        model: LLM_MODEL,
+        temperature: 0.8,
         max_tokens: 4096,
-        system: systemPrompt,
-        output_config: outputConfig,
-        messages: [{ role: 'user', content: userPrompt }],
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
       }),
     });
 
-    if (!anthropicRes.ok) {
-      const detail = await anthropicRes.text();
+    if (!llmRes.ok) {
+      const detail = await llmRes.text();
       return json(
         { error: 'Recipe generation failed.', detail: detail.slice(0, 500) },
         502,
       );
     }
 
-    const data = await anthropicRes.json();
-    if (data.stop_reason === 'refusal') {
-      return json(
-        { error: 'The model declined this request. Try adjusting your preferences.' },
-        422,
-      );
-    }
-
-    const textBlock = (data.content ?? []).find((b: any) => b.type === 'text');
-    if (!textBlock?.text) {
+    const data = await llmRes.json();
+    const content: string | undefined = data?.choices?.[0]?.message?.content;
+    if (!content) {
       return json({ error: 'Empty response from model.' }, 502);
     }
 
-    let parsed: { recipes: unknown[] };
-    try {
-      parsed = JSON.parse(textBlock.text);
-    } catch {
-      return json({ error: 'Could not parse model output.' }, 502);
+    const parsed = parseRecipes(content);
+    if (!parsed) {
+      return json({ error: 'Could not parse model output.', detail: content.slice(0, 300) }, 502);
     }
 
-    return json({ recipes: parsed.recipes ?? [] }, 200);
+    return json({ recipes: parsed }, 200);
   } catch (err) {
     return json({ error: 'Unexpected error.', detail: String(err) }, 500);
   }
 });
+
+/** Defensive JSON extraction — tolerates code fences or stray prose. */
+function parseRecipes(raw: string): unknown[] | null {
+  const tryParse = (s: string): unknown[] | null => {
+    try {
+      const obj = JSON.parse(s);
+      if (Array.isArray(obj)) return obj;
+      if (obj && Array.isArray(obj.recipes)) return obj.recipes;
+      return null;
+    } catch {
+      return null;
+    }
+  };
+
+  let text = raw.trim();
+  // Strip ```json ... ``` fences if present.
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+
+  let out = tryParse(text);
+  if (out) return out;
+
+  // Fall back to the outermost { ... } block.
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first !== -1 && last > first) {
+    out = tryParse(text.slice(first, last + 1));
+    if (out) return out;
+  }
+  return null;
+}
 
 function json(payload: unknown, status: number): Response {
   return new Response(JSON.stringify(payload), {
